@@ -103,11 +103,10 @@ def generate_preview(bl, bw, bh, gl, gw, gh, curvature, a_pos, a_width, r_thick,
     nx, ny, nz = int(gl), int(gw), int(gh)
     
     # Adaptive Downsampling for Performance
-    ds = 1
-    while (nx/ds) * (ny/ds) * (nz/ds) > 12000 and ds < 8:
-        ds += 1
+    # Downsample for preview performance (User complained about speed)
+    # Target approx 30-40 voxels in max dim for fast responsiveness
+    ds = max(1, int(max(nx, ny, nz) / 30))
     
-    # Work directly in downsampled space
     dnx, dny, dnz = nx // ds, ny // ds, nz // ds
     vx = np.zeros((dnx, dny, dnz))
     
@@ -121,15 +120,19 @@ def generate_preview(bl, bw, bh, gl, gw, gh, curvature, a_pos, a_width, r_thick,
         target_z = road_base_h + (curvature/100.0) * (float(bh) * 0.4) * para
         tk = int(target_z / ds)
         
-        # Roadway
+        # Roadway (ID 2)
         for dt_idx in range(max(1, int(r_thick//ds))):
             kk = tk - dt_idx
-            if 0 <= kk < dnz: vx[di, :, kk] = 1.0
+            if 0 <= kk < dnz: vx[di, :, kk] = 2.0
         
-        # Supports (Foundations)
+        # Supports (ID 1)
         if ((i >= a_pos and i < a_pos + a_width) or (i >= nx - a_pos - a_width and i < nx - a_pos)):
             for dk in range(min(dnz, int(4/ds))):
-                if dk < dnz: vx[di, :, dk] = 0.5
+                if dk < dnz:
+                    # Only fill supports where nothing exists yet (preserve Road=2.0)
+                    # Use masking to avoid overwriting existing road voxels
+                    mask = (vx[di, :, dk] == 0)
+                    vx[di, mask, dk] = 1.0
 
     bg_color = '#1a1a1a'
     text_color = '#cccccc'
@@ -138,8 +141,15 @@ def generate_preview(bl, bw, bh, gl, gw, gh, curvature, a_pos, a_width, r_thick,
     ax.set_box_aspect((dnx, dny, dnz))
     apply_view(ax, view_mode)
     
-    ax.voxels(vx > 0.6, facecolors='#4488ff', alpha=0.4) 
-    ax.voxels(vx == 0.5, facecolors='#44cc66', alpha=0.4) 
+    # Optimize Plotting: Single Call
+    filled = vx > 0
+    colors = np.empty(vx.shape, dtype=object)
+    colors[vx == 1.0] = '#44cc6670' # Supports (Green, Alpha hex 70)
+    colors[vx == 2.0] = '#4488ff70' # Road (Blue, Alpha hex 70)
+    
+    # Note: facecolors logic in matplotib handles alpha if embedded in hex or tuple
+    # We use combined hex/alpha
+    ax.voxels(filled, facecolors=colors)
     
     # Calculate height for load point visualization
     cx = lx_abs if lx_abs >= 0 else int((lx_pct/100.0) * float(nx))
@@ -172,9 +182,21 @@ def generate_preview(bl, bw, bh, gl, gw, gh, curvature, a_pos, a_width, r_thick,
     ny_ds = vx.shape[1]
     if l_type == "Punkt":
         # Visual point at EXACT center
-        ax.scatter([cx / ds], [ny / 2.0 / ds], [lz], color='#ff6666', s=300, label='Last')
+        lz_pt = (road_base_h + (curvature/100.0) * (float(bh) * 0.4) * (1.0 - 4.0 * ((cx/nx) - 0.5)**2)) / ds
+        ax.scatter([cx / ds], [ny / 2.0 / ds], [lz_pt + 2], color='#ff6666', s=300, label='Last')
     else:
-        ax.plot([cx / ds, cx / ds], [0, ny / ds], [lz, lz], color='#ff6666', linewidth=6)
+        # Distributed Load: Arrows along the road
+        # Plot 7 arrows distributed along the length
+        for i_arrow in range(1, 8):
+            lx_a = nx * (i_arrow / 8.0)
+            ly_a = ny / 2.0
+            x_norm_a = lx_a / float(nx)
+            para_a = 1.0 - 4.0 * (x_norm_a - 0.5)**2
+            lz_a = (road_base_h + (curvature/100.0) * (float(bh) * 0.4) * para_a) / ds
+            
+            # Quiver (arrow) pointing down
+            # ax.quiver(x, y, z, u, v, w)
+            ax.quiver(lx_a/ds, ly_a/ds, lz_a + 5, 0, 0, -4, color='red', linewidth=2, arrow_length_ratio=0.3)
         
     # Visually restore the scale on the axes even if downsampled
     ax.set_xticks(np.linspace(0, dnx, 5))
@@ -261,7 +283,11 @@ def simulate_bridge(bl, bw, bh, gl, gw, gh, efficiency, bend, a_pos, a_width, r_
         actual_vol_pct = (vox_vol / total_p) * 100.0
         
         mat = MATERIALS.get(material_name, MATERIALS["Stahl"])
-        mass_kg = vox_vol * mat["rho"] 
+        # Mass Calc: Assume 5x5x5mm voxels for PLA context (user request)
+        # 1 voxel = 0.5cm * 0.5cm * 0.5cm = 0.125 cm^3
+        # mass = count * 0.125 * rho
+        vol_cm3_per_voxel = 0.125
+        mass_kg = vox_vol * vol_cm3_per_voxel * mat["rho"] / 1000.0
         
         # Naming Logic: Nummer"Bridge"HöhexBreitexLänge
         counter_file = "counter.txt"
@@ -300,7 +326,9 @@ def simulate_bridge(bl, bw, bh, gl, gw, gh, efficiency, bend, a_pos, a_width, r_
             gr.Warning("Statik-Fehler: Keine Last tragende Verbindung gefunden!")
             return None, None, gr.update(selected=0), "Fehler"
             
-        stats_msg = f"### ✅ Ergebnis\n- **Material:** {material_name}\n- **Verbrauch:** {actual_vol_pct:.1f}% des Bauraums\n- **Geschätzte Masse:** {mass_kg:.1f} kg (bei 1dm³/Voxel)"
+        mass_str = f"{mass_kg:.3f}".replace('.', ',')
+        rho_val = mat["rho"]
+        stats_msg = f"### ✅ Ergebnis\n- **Material:** {material_name} ({rho_val} g/cm³)\n- **Verbrauch:** {actual_vol_pct:.1f}% des Bauraums\n- **Masse:** {mass_str} kg\n- **Lasteinleitung:** {l_type}"
         if auto_calc:
             stats_msg = "### 🤖 Auto-Mengenberechnung Errechnet:\n" + stats_msg
             
@@ -357,7 +385,7 @@ with gr.Blocks(title="BridgeMaster3D") as demo:
                 # Checkbox wurde gemäß Benutzerwunsch entfernt (Sperre immer aktiv wenn > 0)
                 
             with gr.Accordion("🎯 Last (Kraft)", open=False, elem_id="load_group_container"):
-                l_type = gr.Radio(["Punkt", "Linie"], value="Punkt", label="Last-Typ", elem_id="id_ltype")
+                l_type = gr.Radio(["Punkt", "Fläche (Verteilt)"], value="Punkt", label="Last-Typ", elem_id="id_ltype")
                 traffic_force_slider = gr.Slider(minimum=0, maximum=1000, value=0, step=1, label="Gewicht in Kg", elem_id="id_force")
                 lx_abs = gr.Slider(-1, 240, value=-1, step=1, label="Feste X-Position (-1 = Deaktiviert)", elem_id="id_lxabs")
                 lx_pct = gr.Slider(0, 100, value=50, step=1, label="Last-Position X (%)", elem_id="id_lxpct")

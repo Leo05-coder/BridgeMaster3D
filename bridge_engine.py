@@ -69,18 +69,16 @@ def reset_all_fields(nx: ti.i32, ny: ti.i32, nz: ti.i32):
         forbidden[i, j, k] = 0
 
 @ti.kernel
-def init_setup_kernel(nx: ti.i32, ny: ti.i32, nz: ti.i32, curv: ti.f32, a_pos: ti.f32, a_width: ti.f32, r_thick: ti.f32, lx_pct: ti.f32, lx_abs: ti.f32, l_type: ti.i32, vol: ti.f32, protect: ti.i32, f_mag: ti.f32, road_base_h: ti.f32, headroom: ti.f32):
+def init_setup_kernel(nx: ti.i32, ny: ti.i32, nz: ti.i32, amp: ti.f32, inv_nx: ti.f32, a_pos: ti.f32, a_width: ti.f32, r_thick: ti.f32, protect: ti.i32, road_base_h: ti.f32, headroom: ti.f32):
     base_h = road_base_h
     for i, j, k in ti.ndrange(nx, ny, nz):
-        x[i, j, k] = vol # Starting density
-        # ROADWAY CALCULATION
+        # Initial volume is set by reset_all_fields
         x_norm = 0.5
-        if nx > 1: x_norm = (float(i) + 0.5) / float(nx)
+        if nx > 1: x_norm = (ti.cast(i, ti.f32) + 0.5) * inv_nx
         para = 1.0 - 4.0 * (x_norm - 0.5)**2
-        # Fix: Nutze Brückenhöhe (base_h) direkt als Fahrbahnhöhe
-        # Der Faktor 0.4 passt zur Vorschau (dort float(bh) * 0.4)
-        target_z = base_h + curv * (float(base_h) * 0.4) * para
-        tk = int(target_z)
+        # Use pre-calculated amplitude (curv * base_h * 0.4)
+        target_z = base_h + amp * para
+        tk = ti.cast(target_z, ti.i32)
         
         # ROADWAY (Passive)
         if k >= tk - (int(r_thick)-1) and k <= tk:
@@ -96,32 +94,28 @@ def init_setup_kernel(nx: ti.i32, ny: ti.i32, nz: ti.i32, curv: ti.f32, a_pos: t
             if k == 0:
                 for di, dj in ti.ndrange(2, 2): fixed[i+di, j+dj, 0] = 1
 
-    # LOAD (Precision Splitting)
-    # Target X
-    cx = lx_abs if lx_abs >= 0 else lx_pct * float(nx)
-    # Target Y (Middle of road)
-    cy = float(ny) / 2.0
-    
-    # 3D Position tracking for Load
-    cx_idx = int(cx)
-    cy_idx = int(cy)
-    
-    # Parabolic height at load position
-    lx_norm = (float(cx) + 0.5) / float(max(1, nx))
-    # Fix: Auch hier Brückenhöhe (base_h) und Faktor 0.4 nutzen
-    l_tk = int(base_h + curv * (float(base_h) * 0.4) * (1.0 - 4.0 * (lx_norm - 0.5)**2))
-    fz = min(nz, l_tk + 1)
-    
-    if l_type == 0: # Point Load
-        # Split across 4 nodes in the top face of the voxel if needed, 
-        # but here we focus on Y-centering per user request.
-        y_frac = cy - float(cy_idx)
-        # Distribute on the center line nodes
-        # Node (cx, cy_idx, fz) and (cx, cy_idx+1, fz)
-        f_ext[int(cx), cy_idx, fz].z += f_mag * (1.0 - y_frac)
-        f_ext[int(cx), cy_idx + 1, fz].z += f_mag * y_frac
-    else: # Line Load
-        for jj in range(ny + 1): f_ext[int(cx), jj, fz].z += f_mag / float(ny+1)
+    # LOAD IS NOW HANDLED IN PYTHON OR SEPARATE KERNEL
+    # Distributed load is handled by separate kernel
+
+@ti.kernel
+def apply_surface_load_kernel(nx: ti.i32, ny: ti.i32, curv: ti.f32, base_h: ti.f32, force_per_node: ti.f32):
+    # Iterate over all surface nodes
+    for i, j in ti.ndrange(nx + 1, ny + 1):
+        x_n = 0.5
+        if nx > 0:
+            x_n = ti.cast(i, ti.f32) / ti.cast(nx, ti.f32)
+            
+        para = 1.0 - 4.0 * (x_n - 0.5)**2
+        # Target Z (top of road)
+        # Use simple arithmetic to avoid complex expression nesting issues
+        h_variation = curv * (base_h * 0.4) * para
+        target_z = base_h + h_variation
+        
+        tk = ti.cast(target_z, ti.i32)
+        node_z = tk + 1
+        
+        if node_z <= MZ:
+            f_ext[i, j, node_z].z += force_per_node
 
 @ti.kernel
 def apply_gravity_kernel(nx: ti.i32, ny: ti.i32, nz: ti.i32, gravity: ti.f32):
@@ -225,8 +219,8 @@ def calc_stress_kernel(nx: ti.i32, ny: ti.i32, nz: ti.i32):
             # Calibration: energy ~ epsilon^2. Sigma ~ E * epsilon ~ sqrt(E_eff * energy).
             # But since we solved with E_engine = 1.0, u is u_normalized.
             # Sigma_approx = sqrt(energy) * factor
-            # With f_mag scaling, factor=40.0 yields realistic MPa results (range 5-200)
-            vonmises[i, j, k] = ti.sqrt(max(0.0, energy)) * 40.0 
+            # With f_mag scaling, factor=150.0 yields realistic MPa results for thin PLA structures
+            vonmises[i, j, k] = ti.sqrt(max(0.0, energy)) * 150.0 
         else:
             vonmises[i, j, k] = 0.0
 
@@ -295,12 +289,53 @@ def run_bridge_optimization(nelx, nely, nelz, volfrac, rmin, curvature, anchor_p
         
         # 1. INITIAL SETUP
         l_type_ti = 0 if load_type == "Punkt" else 1
-        # f_mag calibration: 300kg -> ~3.0. Realistic for Taichi solver range.
-        f_mag = -max(0.1, abs(traffic_load) / 100.0)
+        # f_mag calibration: increased 10x (div 10 instead of 100) to ensure stronger structures for PLA
+        f_mag = -max(0.1, abs(traffic_load) / 10.0)
         
         # Brückenhöhe (bh) ist nun direkt die Fahrbahnhöhe
         road_base_h = float(bh)
-        init_setup_kernel(nx, ny, nz, curvature, anchor_pos, anchor_width, road_thick, load_x_pct, load_x_abs, l_type_ti, current_vol, protect_road, f_mag, road_base_h, float(headroom))
+        # Initialize fields (x = current_vol)
+        x.fill(current_vol)
+        
+        # Brückenhöhe (bh) ist nun direkt die Fahrbahnhöhe
+        road_base_h = float(bh)
+        
+        # Setup Geometry (Road, Supports, Headroom) - No Loads yet
+        # Pre-calc scalar args for Taichi stability
+        amp = curvature * (road_base_h * 0.4)
+        inv_nx = 1.0 / max(1.0, float(nx))
+        init_setup_kernel(nx, ny, nz, amp, inv_nx, anchor_pos, anchor_width, road_thick, protect_road, road_base_h, float(headroom))
+        
+        # Apply Loads (Python side for stability)
+        if l_type_ti == 0: # Point Load
+            cx = float(load_x_abs) if load_x_abs >= 0 else load_x_pct * float(nx)
+            cy = float(ny) / 2.0
+            cx_idx = int(cx)
+            cy_idx = int(cy)
+            
+            # Parabolic height
+            lx_norm = (cx + 0.5) / float(max(1, nx))
+            l_tk = int(road_base_h + curvature * (road_base_h * 0.4) * (1.0 - 4.0 * (lx_norm - 0.5)**2))
+            fz = min(nz, l_tk + 1)
+            
+            y_frac = cy - float(cy_idx)
+            # Apply directly to fields
+            # Need to clamp indices
+            idx_x = min(nx, max(0, cx_idx))
+            idx_y = min(ny, max(0, cy_idx))
+            
+            # Note: f_ext is (nx+1, ny+1, nz+1)
+            # We use atomic add logic or just +=
+            f_ext[idx_x, idx_y, fz].z += f_mag * (1.0 - y_frac)
+            f_ext[idx_x, idx_y + 1, fz].z += f_mag * y_frac
+            
+        elif l_type_ti == 1: # Distributed Load
+            # Calculate force per node in Python to avoid Taichi IR issues
+            # Total nodes on surface = (nx+1)*(ny+1)
+            nodes_count = (nx + 1) * (ny + 1)
+            f_node = f_mag / max(1.0, float(nodes_count))
+            apply_surface_load_kernel(nx, ny, curvature, road_base_h, f_node)
+            
         enforce_passive_kernel(nx, ny, nz)
         
         penal = 3.0
@@ -361,28 +396,39 @@ def run_bridge_optimization(nelx, nely, nelz, volfrac, rmin, curvature, anchor_p
         # After each pass: Calculate Stress
         calc_stress_kernel(nx, ny, nz)
         vm_np = vonmises.to_numpy()[:nx, :ny, :nz]
-        # Ignore outliers (97.0th percentile) to allow removing even more material
-        max_vm = np.percentile(vm_np[xPhys.to_numpy()[:nx,:ny,:nz] > 0.4], 97.0) if np.any(xPhys.to_numpy()[:nx,:ny,:nz] > 0.4) else 0.0
+        xp_check = xPhys.to_numpy()[:nx, :ny, :nz]
+        
+        # Check stress on voxels with any meaningful density (> 0.1), not just solid (>0.4)
+        # This prevents the "death spiral" where low vol → no solid voxels → stress=0 → even lower vol
+        has_solid = np.any(xp_check > 0.4)
+        stress_mask = xp_check > 0.1
+        if np.any(stress_mask):
+            max_vm = np.percentile(vm_np[stress_mask], 97.0)
+        else:
+            max_vm = 0.0
         
         if not auto_calc:
             break
         
-        # Auto-Calc Volume Adjustment
-        # SF = sigma_y / max_vm. We want SF = safety_factor.
-        # Required volume scale = max_vm / target_sigma
-        # Auto-Calc Volume Adjustment with Damping (0.5) to prevent oscillations
-        vol_scale = max_vm / (target_sigma + 1e-9)
-        # Apply square root damping for volume scaling (linear stress vs quadratic energy approx)
-        vol_scale = ti.math.sqrt(vol_scale) if vol_scale > 1.0 else vol_scale 
+        # If NO solid voxels above export threshold, vol is too low → increase it
+        if not has_solid:
+            new_vol = min(0.60, current_vol * 1.5)
+            print(f"Pass {outer+1}: No solid structure! Increasing Vol: {current_vol*100:.1f}% -> {new_vol*100:.1f}%")
+            current_vol = new_vol
+            continue
         
-        # Limit the step size for stability (Lower limit from 0.7 to 0.3 for faster reduction)
-        vol_scale = max(0.3, min(1.5, vol_scale))
+        # Auto-Calc Volume Adjustment
+        vol_scale = max_vm / (target_sigma + 1e-9)
+        if vol_scale > 1.0:
+            vol_scale = vol_scale ** 0.5  # sqrt damping
+        
+        vol_scale = max(0.5, min(1.5, vol_scale))
         
         new_vol = current_vol * vol_scale
-        # Damping the update: new = old + 0.5 * (target - old)
         new_vol = current_vol + 0.5 * (new_vol - current_vol)
         
-        new_vol = max(0.02, min(0.60, new_vol))
+        # Floor at 5% (enough for minimal bridge columns)
+        new_vol = max(0.05, min(0.60, new_vol))
         
         print(f"Pass {outer+1}: Max Stress = {max_vm:.1f} MPa, Target = {target_sigma:.1f} MPa. Adj Vol: {current_vol*100:.1f}% -> {new_vol*100:.1f}%")
         
@@ -399,9 +445,21 @@ def run_bridge_optimization(nelx, nely, nelz, volfrac, rmin, curvature, anchor_p
     passive_np = passive.to_numpy()[:nx, :ny, :nz]
     is_passive = passive_np == 1  # Road/supports: NEVER touch
     
-    # === PHASE 1: BFS Connectivity (remove floating parts) ===
-    x_np = x.to_numpy()[:nx, :ny, :nz]
+    # First, get the filtered physical densities (this is what gets exported)
+    filter_vars_kernel(nx, ny, nz, rmin)
+    xp = xPhys.to_numpy()[:nx, :ny, :nz]
     
+    # Use a low threshold for BFS (0.1) to catch ALL structural material,
+    # not just fully dense voxels. The export threshold (0.4) handles visual cleanup.
+    bfs_threshold = 0.1
+    
+    # Debug: Count what we have before cleanup
+    n_total = int(np.sum(xp > bfs_threshold))
+    n_passive = int(np.sum(is_passive))
+    n_struct = n_total - n_passive
+    print(f"Cleanup: {n_struct} structural + {n_passive} passive voxels before pruning")
+    
+    # === PHASE 1: BFS Connectivity (remove floating parts) ===
     # Seed from foundations (bottom anchor voxels)
     reach = np.zeros((nx, ny, nz), dtype=bool)
     q_bfs = deque()
@@ -410,7 +468,7 @@ def run_bridge_optimization(nelx, nely, nelz, volfrac, rmin, curvature, anchor_p
             for k in range(min(3, nz)):
                 if ((i >= anchor_pos and i < anchor_pos + anchor_width) or 
                     (i >= nx - anchor_pos - anchor_width and i < nx - anchor_pos)):
-                    if x_np[i, j, k] > 0.4 or is_passive[i, j, k]:
+                    if xp[i, j, k] > bfs_threshold or is_passive[i, j, k]:
                         reach[i, j, k] = True; q_bfs.append((i, j, k))
     # Also seed from ALL passive voxels (road is always "connected")
     for i, j, k in zip(*np.where(is_passive)):
@@ -422,12 +480,14 @@ def run_bridge_optimization(nelx, nely, nelz, volfrac, rmin, curvature, anchor_p
         for di, dj, dk in [(-1,0,0),(1,0,0),(0,-1,0),(0,1,0),(0,0,-1),(0,0,1)]:
             ni, nj, nk = ci+di, cj+dj, ck+dk
             if 0 <= ni < nx and 0 <= nj < ny and 0 <= nk < nz:
-                if not reach[ni, nj, nk] and x_np[ni, nj, nk] > 0.4:
+                if not reach[ni, nj, nk] and xp[ni, nj, nk] > bfs_threshold:
                     reach[ni, nj, nk] = True; q_bfs.append((ni, nj, nk))
     
-    # Remove everything not reachable (floating) — except passive
-    float_removed = np.sum(~reach & ~is_passive & (x_np > 0.4))
-    x_np[~reach & ~is_passive] = 0.0
+    # Remove floating parts from x (design variable) — except passive
+    x_np = x.to_numpy()[:nx, :ny, :nz]
+    float_mask = ~reach & ~is_passive & (xp > bfs_threshold)
+    float_removed = int(np.sum(float_mask))
+    x_np[float_mask] = 0.0
     print(f"Phase 1 (BFS): removed {float_removed} floating voxels")
     
     x_full = np.zeros((MX, MY, MZ), dtype=np.float32)
@@ -436,19 +496,14 @@ def run_bridge_optimization(nelx, nely, nelz, volfrac, rmin, curvature, anchor_p
     enforce_passive_kernel(nx, ny, nz)
     
     # === PHASE 2: Iterative Energy Pruning (remove non-load-bearing parts) ===
-    # Uses the EXISTING Taichi FEA solver + calc_sensitivity_kernel.
-    # dc[i,j,k] stores -dC/dx which is proportional to strain energy.
-    # Voxels with |dc| ≈ 0 contribute nothing to structural integrity.
-    
     prune_penal = 3.0
     for prune_iter in range(5):
-        x_np = x.to_numpy()[:nx, :ny, :nz]
-        n_active_before = int(np.sum((x_np > 0.4) & ~is_passive))
-        if n_active_before == 0:
-            break
-        
-        # Run FEA without gravity (external load only)
         filter_vars_kernel(nx, ny, nz, rmin)
+        xp = xPhys.to_numpy()[:nx, :ny, :nz]
+        n_active_before = int(np.sum((xp > 0.4) & ~is_passive))
+        if n_active_before == 0:
+            print(f"Phase 2: no active voxels above export threshold, skipping")
+            break
         
         # Reset displacements
         u_zero = np.zeros((MX+1, MY+1, MZ+1, 3), dtype=np.float32)
@@ -475,17 +530,20 @@ def run_bridge_optimization(nelx, nely, nelz, volfrac, rmin, curvature, anchor_p
         dc_np = np.abs(dc.to_numpy()[:nx, :ny, :nz])
         
         # Threshold: remove voxels with energy < 1% of median
-        active_dc = dc_np[(x_np > 0.4) & ~is_passive]
+        active_dc = dc_np[(xp > 0.4) & ~is_passive]
         if len(active_dc) == 0 or not np.any(active_dc > 0):
             break
         median_dc = np.median(active_dc[active_dc > 0])
         cut = median_dc * 0.01
         
         # Remove low-energy voxels (never passive!)
-        remove_mask = (dc_np < cut) & (x_np > 0.4) & ~is_passive
+        x_np = x.to_numpy()[:nx, :ny, :nz]
+        remove_mask = (dc_np < cut) & (xp > 0.4) & ~is_passive
         x_np[remove_mask] = 0.0
         
         # BFS again to remove anything that became disconnected
+        filter_vars_kernel(nx, ny, nz, rmin)
+        xp2 = xPhys.to_numpy()[:nx, :ny, :nz]
         reach2 = np.zeros((nx, ny, nz), dtype=bool)
         q2 = deque()
         for i in range(nx):
@@ -493,7 +551,7 @@ def run_bridge_optimization(nelx, nely, nelz, volfrac, rmin, curvature, anchor_p
                 for k in range(min(3, nz)):
                     if ((i >= anchor_pos and i < anchor_pos + anchor_width) or 
                         (i >= nx - anchor_pos - anchor_width and i < nx - anchor_pos)):
-                        if x_np[i, j, k] > 0.4 or is_passive[i, j, k]:
+                        if x_np[i, j, k] > bfs_threshold or is_passive[i, j, k]:
                             reach2[i, j, k] = True; q2.append((i, j, k))
         for i, j, k in zip(*np.where(is_passive)):
             if not reach2[i, j, k]:
@@ -503,11 +561,11 @@ def run_bridge_optimization(nelx, nely, nelz, volfrac, rmin, curvature, anchor_p
             for di, dj, dk in [(-1,0,0),(1,0,0),(0,-1,0),(0,1,0),(0,0,-1),(0,0,1)]:
                 ni, nj, nk = ci+di, cj+dj, ck+dk
                 if 0 <= ni < nx and 0 <= nj < ny and 0 <= nk < nz:
-                    if not reach2[ni, nj, nk] and x_np[ni, nj, nk] > 0.4:
+                    if not reach2[ni, nj, nk] and x_np[ni, nj, nk] > bfs_threshold:
                         reach2[ni, nj, nk] = True; q2.append((ni, nj, nk))
-        x_np[~reach2 & ~is_passive & (x_np > 0.4)] = 0.0
+        x_np[~reach2 & ~is_passive & (x_np > bfs_threshold)] = 0.0
         
-        n_removed = n_active_before - int(np.sum((x_np > 0.4) & ~is_passive))
+        n_removed = n_active_before - int(np.sum((xPhys.to_numpy()[:nx, :ny, :nz] > 0.4) & ~is_passive))
         print(f"Phase 2 pass {prune_iter+1}: removed {n_removed} non-load-bearing voxels")
         
         if n_removed == 0:
@@ -527,7 +585,11 @@ def run_bridge_optimization(nelx, nely, nelz, volfrac, rmin, curvature, anchor_p
     x.from_numpy(x_final)
     
     filter_vars_kernel(nx, ny, nz, rmin)
-    return xPhys.to_numpy()[:nx, :ny, :nz]
+    result = xPhys.to_numpy()[:nx, :ny, :nz]
+    n_final = int(np.sum(result > 0.4))
+    print(f"Final: {n_final} voxels in exported model (threshold=0.4)")
+    ti.sync() # Ensure completion
+    return result
 
 
 # FORCE MATERIALIZATION ON MAIN THREAD
